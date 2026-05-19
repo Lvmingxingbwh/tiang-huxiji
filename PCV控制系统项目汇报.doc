@@ -1,0 +1,76 @@
+<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">
+<head>
+<meta charset="utf-8">
+<title>呼吸机 PCV 模式增量式 PID 控制系统项目总结报告</title>
+<style>
+  body { font-family: "Microsoft YaHei", "SimSun", sans-serif; line-height: 1.6; padding: 20px; }
+  h1 { text-align: center; font-size: 22pt; margin-bottom: 30px; }
+  h2 { font-size: 16pt; margin-top: 25px; border-bottom: 2px solid #333; padding-bottom: 5px; color: #2c3e50; }
+  h3 { font-size: 14pt; margin-top: 15px; color: #34495e; }
+  p { font-size: 12pt; text-indent: 2em; margin-bottom: 10px; }
+  ul { font-size: 12pt; margin-bottom: 10px; }
+  li { margin-bottom: 5px; }
+  strong { color: #d35400; }
+</style>
+</head>
+<body>
+
+<h1>呼吸机 PCV 模式增量式 PID 控制系统项目总结报告</h1>
+
+<h2>一、 项目背景与核心目标</h2>
+<p>在本项目中，我们针对呼吸机的 <strong>PCV（压力控制通气）模式</strong> 进行了底层控制算法重构。原系统在吸气相采用开环控制或简单的阈值控制，导致目标压力极易超调、气流存在严重冲击且不够顺畅。</p>
+<p>为了实现<strong>平滑充气</strong>和<strong>精准的平台压力维持</strong>，我们在主控循环（5ms中断周期）中引入了基于 C 语言的<strong>增量式 PID 控制算法</strong>，全面接管了吸气相的比例气阀（如 PVQ33 系列）控制，以达到医疗级设备的压力稳定标准。</p>
+
+
+<h2>二、 核心理论：为什么选择“增量式 PID”？</h2>
+<p>在呼吸机气路控制中，经过理论推导与真机测试，我们最终坚决选择了<strong>增量式 PID</strong> 而非传统的位置式 PID，主要是基于以下三大工程优势：</p>
+<ul>
+    <li><strong>更高的安全性（防飞车）</strong>：增量式 PID 每次计算的是气阀占空比的<strong>变化量（Δu）</strong>，而不是绝对位置。如果传感器突发故障或程序异常，算法只会输出增量而不会因为历史积分累积（Windup）瞬间给出一个让阀门“全开”的满量程指令，这有效防止了气压骤升导致的患者气压伤（Barotrauma）。</li>
+    <li><strong>极其平滑的动态阻尼特性（天生适配气流）</strong>：在增量式算法中，比例项（P项）的数学本质是响应压力误差的<strong>变化率</strong>。因此，当肺内压力快速上升时，P项会提前产生巨大的负向“刹车”阻力，天然具备极强的阻尼防超调能力；而积分项（I项）则成为了平滑推开阀门的主要动力。</li>
+    <li><strong>无扰动模式切换</strong>：由于它只输出增量，非常适合与呼吸机的模式切换（比如从其他模式切换到闭环的 PCV 模式）进行无缝衔接，不会产生阀门的突兀跳动。</li>
+</ul>
+
+
+<h2>三、 项目实战与调参避坑指南</h2>
+<p>在真实的硬件联调过程中，仅仅依靠 PID 公式是无法控制好气路的。我们遇到了一系列极具代表性的硬件工程难题，并逐一攻克：</p>
+
+<h3>1. 初始冲击（Derivative Kick）与气路干扰</h3>
+<ul>
+    <li><strong>现象</strong>：刚进入吸气相时，压力瞬间飙升出现尖峰；同时发现即使 PID 参数调得极小，压力依然会直线上升至极高值且没有平顶期。</li>
+    <li><strong>解决策略</strong>：
+        <br>1) 算法层：在 <code>PCV_Reset()</code> 中，我们在切换相位的瞬间将历史误差强制等于当前误差，让 Δe 初始为 0，彻底消灭了切换瞬间的微分突变冲击。
+        <br>2) 系统层：排查发现原有的开环控制代码（空气阀和氧气阀的强制开启）在定时器中断里仍在并行运行。我们<strong>彻底切断了干扰项</strong>，确保唯一的比例阀完全受控于闭环 PID，解决了“双开门漏气”问题。
+    </li>
+</ul>
+
+<h3>2. 阀门高频打颤（Limit Cycle / 流量实心波形）</h3>
+<ul>
+    <li><strong>现象</strong>：到达平台压力后，屏幕上的流量波形变成了一整块实心方块，且充气出现“一顿一顿”的顿挫感和打颤声。</li>
+    <li><strong>原因分析</strong>：为了跳过比例阀物理上的“不响应区”，代码加入了死区补偿（Insp_Deadband）。但由于死区参数<strong>预估过大（如 35%）</strong>，叠加解除了 PID 输出限幅，导致只要压力有极微小的波动，物理 PWM 就会在 0%（彻底关死）和 35%（瞬间大开）之间以 200Hz 的频率疯狂横跳，形成“极限环震荡”。</li>
+    <li><strong>解决策略</strong>：
+        <br>1) <strong>降低死区过补偿</strong>：将补偿参数下调至真实物理死区的边缘（如 15%），确保阀门在低频微调时处于“微漏”而非“大开”状态。
+        <br>2) <strong>恢复机械低通滤波器</strong>：重新启用严格的<strong>双向对称限幅（Slew Rate Limiting, max_delta = 10.0f）</strong>。这一步极其关键，它在控制系统中充当了一个极佳的低通滤波器，强制滤掉了因为噪音带来的高频震荡，找回了极致顺滑的进气波形。
+    </li>
+</ul>
+
+<h3>3. “超调”与“平滑”的终极博弈：目标偏移补偿 (Target Offset)</h3>
+<ul>
+    <li><strong>现象</strong>：恢复对称限幅后，进气波形变得极其平滑，但由于气流惯性和机械延迟，每次总会<strong>稳定超调 1.0~1.5 cmH2O</strong>。如果此时强行在算法里加入不对称的“急刹车”，又会破坏顺滑度，导致气流顿挫。</li>
+    <li><strong>终极工程解法（暗度陈仓）</strong>：在医疗器械的工业界，我们采用了非常经典且稳妥的工程手段。在不破坏任何底层平滑算法的前提下，我们在代码中引入了<strong>目标偏移补偿</strong>。
+        <br>若用户设定的目标是 <code>20.0 cmH2O</code>，我们在底层代码中扣除固定惯性余量（如 <code>1.2 cmH2O</code>），让内部 PID 全力且顺滑地去追踪 <code>18.8 cmH2O</code>。气流极其平滑地逼近 18.8 时平缓收油门，依靠物理惯性最终刚好完美滑行并稳定在 <code>20.0 cmH2O</code>。
+        <br><strong>成果</strong>：做到了 0 超调的同时，100% 留住了最顺滑的流体力学波形！
+    </li>
+</ul>
+
+<h3>4. 视觉毛刺与控制延迟的矛盾：显控分离架构</h3>
+<ul>
+    <li><strong>现象</strong>：为了让底层 PID 控制器反应最灵敏，传感器数据不能加滤波（滤波会引入相移导致系统震荡）。但如果将带噪的原始数据直接画到屏幕上，线条边缘会有密密麻麻的毛刺，视觉观感不佳。</li>
+    <li><strong>解决策略</strong>：我们在代码中引入了 <strong>“显示与控制分离”</strong> 架构。底层 PID 依然获取 0 延迟的原始 AD 值；而在负责画图的 <code>draw()</code> 函数中，专门建立独立的 IIR 一阶低通滤波器，并将其“滤波强度系数”做成了可调全局变量。这样既稳住了底层硬件，又在屏幕上呈现出像丝绸一样平滑的高级波形。</li>
+</ul>
+
+
+<h2>四、 项目总结语</h2>
+<p>通过本次 PCV PID 模块的重构与联调，我深刻认识到了理论公式与真实物理硬件结合时的难点。在医疗呼吸设备的研发中，“平滑顺畅”往往比“绝对数学精准”更重要，因为它直接关乎患者的人机对抗风险与舒适度。面对控制延迟和惯性超调，利用死区约束、输出限幅以及“目标偏移补偿”等工程思想，才能用最小的代价打造出稳定、可靠且具有极致体验的底层驱动平台。</p>
+
+</body>
+</html>
